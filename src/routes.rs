@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use diesel::prelude::*;
 use lazy_static::lazy_static;
+use rocket::http::Status;
 use rocket::response::content;
-use rocket::response::status::NotFound;
+use rocket::response::status::Custom;
 
 use crate::models::SponsorTime;
 use crate::{Db, Segment, Sponsor};
@@ -33,20 +34,21 @@ pub async fn skip_segments(
     hash: String,
     categories: Option<&str>,
     db: Db,
-) -> Result<content::RawJson<String>, NotFound<String>> {
+) -> Result<content::RawJson<String>, Custom<&'static str>> {
     let hash = hash.to_lowercase();
 
     // Check if hash matches hex regex
     if !HASH_RE.is_match(&hash) {
-        return Err(NotFound(
-            "Hash prefix does not match format requirements.".to_string(),
+        return Err(Custom(
+            Status::BadRequest,
+            "Hash prefix does not match format requirements.",
         ));
     }
 
     let sponsors = find_skip_segments(VideoName::ByHashPrefix(hash.clone()), categories, db).await;
 
     if sponsors.is_empty() {
-        return Err(NotFound("Not found".to_string()));
+        return Err(Custom(Status::NotFound, "Not Found"));
     }
 
     Ok(content::RawJson(serde_json::to_string(&sponsors).unwrap()))
@@ -57,18 +59,19 @@ pub async fn skip_segments_by_id(
     #[allow(non_snake_case)] videoID: String,
     categories: Option<&str>,
     db: Db,
-) -> Result<content::RawJson<String>, NotFound<String>> {
+) -> Result<content::RawJson<String>, Custom<&'static str>> {
     // Check if ID matches ID regex
     if !ID_RE.is_match(&videoID) {
-        return Err(NotFound(
-            "videoID does not match format requirements".to_string(),
+        return Err(Custom(
+            Status::BadRequest,
+            "videoID does not match format requirements",
         ));
     }
 
     let sponsors = find_skip_segments(VideoName::ByID(videoID.clone()), categories, db).await;
 
     if sponsors.is_empty() {
-        return Err(NotFound("Not found".to_string()));
+        return Err(Custom(Status::NotFound, "Not Found"));
     }
 
     // Doing a lookup by video ID should return only one Sponsor object with
