@@ -3,20 +3,15 @@ use std::collections::HashMap;
 use diesel::prelude::*;
 use lazy_static::lazy_static;
 use rocket::response::content;
+use rocket::response::status::NotFound;
 
-use crate::{Db, Segment, Sponsor};
 use crate::models::SponsorTime;
+use crate::{Db, Segment, Sponsor};
 // We *must* use "videoID" as an argument name to get Rocket to let us access
 // the query parameter by that name, but if videoID is already used we
 // can't do that.
 use crate::schema::sponsorTimes::dsl::{
-    category,
-    hashedVideoID,
-    hidden,
-    shadowHidden,
-    sponsorTimes,
-    videoID as column_videoID,
-    votes,
+    category, hashedVideoID, hidden, shadowHidden, sponsorTimes, videoID as column_videoID, votes,
 };
 
 // init regexes to match hash/hex or video ID
@@ -33,121 +28,96 @@ enum VideoName {
     ByID(String),
 }
 
-
 #[get("/api/skipSegments/<hash>?<categories>")]
 pub async fn skip_segments(
     hash: String,
     categories: Option<&str>,
     db: Db,
-) -> content::RawJson<String> {
+) -> Result<content::RawJson<String>, NotFound<String>> {
     let hash = hash.to_lowercase();
 
     // Check if hash matches hex regex
     if !HASH_RE.is_match(&hash) {
-        return content::RawJson("Hash prefix does not match format requirements.".to_string());
+        return Err(NotFound(
+            "Hash prefix does not match format requirements.".to_string(),
+        ));
     }
 
     let sponsors = find_skip_segments(VideoName::ByHashPrefix(hash.clone()), categories, db).await;
 
     if sponsors.is_empty() {
-        // Fall back to central Sponsorblock server
-        let resp = reqwest::get(format!(
-            "https://sponsor.ajay.app/api/skipSegments/{}?categories={}",
-            hash,
-            categories.unwrap_or("[\"sponsor\"]"),
-        ))
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-
-        return content::RawJson(resp);
+        return Err(NotFound("Not found".to_string()));
     }
 
-    content::RawJson(serde_json::to_string(&sponsors).unwrap())
+    Ok(content::RawJson(serde_json::to_string(&sponsors).unwrap()))
 }
 
 #[get("/api/skipSegments?<videoID>&<categories>")]
 pub async fn skip_segments_by_id(
-    #[allow(non_snake_case)]
-    videoID: String,
+    #[allow(non_snake_case)] videoID: String,
     categories: Option<&str>,
     db: Db,
-) -> content::RawJson<String> {
-
+) -> Result<content::RawJson<String>, NotFound<String>> {
     // Check if ID matches ID regex
     if !ID_RE.is_match(&videoID) {
-        return content::RawJson("videoID does not match format requirements".to_string());
+        return Err(NotFound(
+            "videoID does not match format requirements".to_string(),
+        ));
     }
 
     let sponsors = find_skip_segments(VideoName::ByID(videoID.clone()), categories, db).await;
 
     if sponsors.is_empty() {
-        // Fall back to central Sponsorblock server
-        let resp = reqwest::get(format!(
-            "https://sponsor.ajay.app/api/skipSegments?videoID={}&categories={}",
-            videoID,
-            categories.unwrap_or("[\"sponsor\"]"),
-        ))
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-
-        return content::RawJson(resp);
+        return Err(NotFound("Not found".to_string()));
     }
 
     // Doing a lookup by video ID should return only one Sponsor object with
     // one list of segments. We need to return just the list of segments.
-    content::RawJson(serde_json::to_string(&sponsors[0].segments).unwrap())
+    Ok(content::RawJson(
+        serde_json::to_string(&sponsors[0].segments).unwrap(),
+    ))
 }
 
-async fn find_skip_segments(
-    name: VideoName,
-    categories: Option<&str>,
-    db: Db,
-) -> Vec<Sponsor> {
+async fn find_skip_segments(name: VideoName, categories: Option<&str>, db: Db) -> Vec<Sponsor> {
     let cat: Vec<String> = serde_json::from_str(categories.unwrap_or("[\"sponsor\"]")).unwrap();
 
     if cat.is_empty() {
         return Vec::new();
     }
 
-    let results: Vec<SponsorTime> = db.run(move |conn| {
-        let base_filter = sponsorTimes
-            .filter(shadowHidden.eq(0))
-            .filter(hidden.eq(0))
-            .filter(votes.ge(0))
-            .filter(category.eq_any(cat)); // We know cat isn't empty at this point
+    let results: Vec<SponsorTime> = db
+        .run(move |conn| {
+            let base_filter = sponsorTimes
+                .filter(shadowHidden.eq(0))
+                .filter(hidden.eq(0))
+                .filter(votes.ge(0))
+                .filter(category.eq_any(cat)); // We know cat isn't empty at this point
 
-        match name {
-            VideoName::ByHashPrefix(hash_prefix) => {
-                base_filter
+            match name {
+                VideoName::ByHashPrefix(hash_prefix) => base_filter
                     .filter(hashedVideoID.like(format!("{}%", hash_prefix)))
                     .get_results::<SponsorTime>(conn)
-                    .expect("Failed to query sponsor times")
-            }
-            VideoName::ByID(video_id) => {
-                base_filter
+                    .expect("Failed to query sponsor times"),
+                VideoName::ByID(video_id) => base_filter
                     .filter(column_videoID.eq(video_id))
                     .get_results::<SponsorTime>(conn)
-                    .expect("Failed to query sponsor times")
+                    .expect("Failed to query sponsor times"),
             }
-        }
-    }).await;
+        })
+        .await;
 
     // Create map of Sponsors - Hash, Sponsor
     let mut sponsors: HashMap<String, Sponsor> = HashMap::new();
 
     for result in &results {
         let sponsor = {
-            sponsors.entry(result.hashed_video_id.clone()).or_insert(Sponsor {
-                hash: result.hashed_video_id.clone(),
-                video_id: result.video_id.clone(),
-                segments: Vec::new(),
-            })
+            sponsors
+                .entry(result.hashed_video_id.clone())
+                .or_insert(Sponsor {
+                    hash: result.hashed_video_id.clone(),
+                    video_id: result.video_id.clone(),
+                    segments: Vec::new(),
+                })
         };
 
         let segment = build_segment(result);
@@ -157,7 +127,13 @@ async fn find_skip_segments(
         let mut found_similar = false;
 
         for seg in &sponsor.segments {
-            if is_overlap(&segment, &seg.category, &seg.action_type, seg.segment[0], seg.segment[1]) {
+            if is_overlap(
+                &segment,
+                &seg.category,
+                &seg.action_type,
+                seg.segment[0],
+                seg.segment[1],
+            ) {
                 found_similar = true;
                 break;
             }
@@ -197,7 +173,13 @@ fn similar_segments(segment: &Segment, hash: &str, segments: &Vec<SponsorTime>) 
             continue;
         }
 
-        let is_similar = is_overlap(segment, &seg.category, &seg.action_type, seg.start_time, seg.end_time);
+        let is_similar = is_overlap(
+            segment,
+            &seg.category,
+            &seg.action_type,
+            seg.start_time,
+            seg.end_time,
+        );
 
         if is_similar {
             similar_segments.push(build_segment(seg));
